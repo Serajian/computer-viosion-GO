@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -51,6 +52,14 @@ func main() {
 
 	// Eye cascade for secondary validation (reduces false positives)
 	eyeClf := classifiers.Eye()
+	// Object detector (full body)
+	objDet, err := NewObjectDetector()
+	if err != nil {
+		slog.Error("load object cascade failed", "err", err)
+		return
+	}
+	objDet.ScaleFactor = 1.03
+	objDet.MinNeighbors = 4
 
 	// 3) make matrix
 	frame := gocv.NewMat()
@@ -62,6 +71,7 @@ func main() {
 		_ = edges.Close()
 		_ = face.Close()
 		_ = eyeClf.Close()
+		objDet.Close()
 	}()
 
 	// State
@@ -70,13 +80,7 @@ func main() {
 	var fps float64
 	frames := 0
 	lastTick := time.Now()
-
-	w, h := frame.Cols(), frame.Rows()
-	short := w
-	if h < w {
-		short = h
-	}
-	minSize := image.Pt(short/12, short/12)
+	//minSize := getMinSize(&frame)
 
 	for {
 		ok := webcam.Read(&frame)
@@ -84,6 +88,9 @@ func main() {
 			slog.Error("Unable to read frame from cam")
 			continue
 		}
+
+		minSize := getMinSize(&frame)
+		objDet.MinSize = minSize
 
 		// Process per mode
 		display := frame // will be used for drawing/preview
@@ -127,7 +134,7 @@ func main() {
 		)
 
 		// draw boxes
-		accepted := 0
+		acceptedFace := 0
 		for _, f := range faces {
 			// quick geometry filter to reduce false positives
 			aspect := float64(f.Dx()) / float64(f.Dy())
@@ -157,12 +164,34 @@ func main() {
 			}
 			putShadowText(&display, "human", image.Pt(f.Min.X, y), 1.4)
 
-			accepted++
+			acceptedFace++
+		}
+
+		// --- Object detection on the same gray frame ---
+		objects := objDet.Detect(gray)
+		for _, r := range objects {
+			// گزینه: فیلتر خیلی ریزها (اگر دوست داشتی)
+			if r.Dx() < 24 || r.Dy() < 24 {
+				continue
+			}
+			_ = gocv.Rectangle(&display, r, getColor("red"), 2)
+
+			yy := r.Min.Y - 8
+			if yy < 18 {
+				yy = r.Min.Y + 18
+			}
+			putShadowText(&display, objDet.Label, image.Pt(r.Min.X, yy), 1.2)
 		}
 
 		// draw count
 		_ = gocv.PutText(&display,
-			fmt.Sprintf("Faces: %d", accepted),
+			fmt.Sprintf("Objects: %d", len(objects)),
+			image.Pt(10, 100),
+			gocv.FontHersheyPlain, 1.5, getColor("red"), 2,
+		)
+
+		_ = gocv.PutText(&display,
+			fmt.Sprintf("Faces: %d", acceptedFace),
 			image.Pt(10, 75),
 			gocv.FontHersheyPlain, 1.5, getColor("green"), 2,
 		)
@@ -228,4 +257,53 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ObjectDetector --- Object detector "class" (Cascade-based) ---
+type ObjectDetector struct {
+	clf          gocv.CascadeClassifier
+	Label        string
+	ScaleFactor  float64
+	MinNeighbors int
+	MinSize      image.Point
+}
+
+func NewObjectDetector() (*ObjectDetector, error) {
+	clf := gocv.NewCascadeClassifier()
+	if ok := clf.Load("./assets/haarcascade_upperbody.xml"); !ok {
+		return nil, errors.New("failed to load cascade")
+	}
+	return &ObjectDetector{
+		clf:          clf,
+		Label:        "object",
+		ScaleFactor:  1.05,
+		MinNeighbors: 5,
+		MinSize:      image.Pt(30, 30),
+	}, nil
+}
+
+func (od *ObjectDetector) Close() {
+	_ = od.clf.Close()
+}
+
+func (od *ObjectDetector) Detect(gray gocv.Mat) []image.Rectangle {
+	return od.clf.DetectMultiScaleWithParams(
+		gray,
+		od.ScaleFactor,
+		od.MinNeighbors,
+		0,
+		od.MinSize,
+		image.Pt(0, 0),
+	)
+}
+
+func getMinSize(mat *gocv.Mat) image.Point {
+	w, h := mat.Cols(), mat.Rows()
+	short := w
+	if h < w {
+		short = h
+	}
+	minSize := image.Pt(short/12, short/12)
+
+	return minSize
 }
