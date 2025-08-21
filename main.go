@@ -7,18 +7,27 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Serajian/computer-viosion-GO.git/classifiers"
 	"gocv.io/x/gocv"
+)
+
+const (
+	width  = 740
+	height = 320
 )
 
 func main() {
 	fmt.Println("START CV")
 	// 1) run webcam
 	camID := 0
-	webcam, err := gocv.OpenVideoCapture(camID)
+	webcam, err := gocv.OpenVideoCaptureWithAPI(camID, gocv.VideoCaptureAVFoundation)
 	if err != nil {
 		slog.Error(err.Error())
 		return
 	}
+	webcam.Set(gocv.VideoCaptureFrameWidth, width)
+	webcam.Set(gocv.VideoCaptureFrameHeight, height)
+	webcam.Set(gocv.VideoCaptureFPS, 30)
 	defer func() {
 		err = webcam.Close()
 		if err != nil {
@@ -35,20 +44,14 @@ func main() {
 	defer func() {
 		_ = window.Close()
 	}()
+	_ = window.ResizeWindow(width, height)
 
-	_ = window.ResizeWindow(970, 550)
+	// Face cascade for first validation
+	face := classifiers.Face()
 
-	classifier := gocv.NewCascadeClassifier()
-	if ok := classifier.Load("./assets/haarcascade_frontalface_alt2.xml"); !ok {
-		slog.Error("failed to load Haar cascade")
-		return
-	}
 	// Eye cascade for secondary validation (reduces false positives)
-	eyeClf := gocv.NewCascadeClassifier()
-	if ok := eyeClf.Load("./assets/haarcascade_eye_tree_eyeglasses.xml"); !ok {
-		slog.Error("failed to load Eye cascade")
-		return
-	}
+	eyeClf := classifiers.Eye()
+
 	// 3) make matrix
 	frame := gocv.NewMat()
 	gray := gocv.NewMat()
@@ -57,7 +60,7 @@ func main() {
 		_ = frame.Close()
 		_ = gray.Close()
 		_ = edges.Close()
-		_ = classifier.Close()
+		_ = face.Close()
 		_ = eyeClf.Close()
 	}()
 
@@ -88,6 +91,7 @@ func main() {
 		if flip {
 			_ = gocv.Flip(frame, &frame, 1)
 		}
+
 		switch mode {
 		case "gray":
 			_ = gocv.CvtColor(display, &gray, gocv.ColorBGRToGray)
@@ -112,9 +116,8 @@ func main() {
 
 		// detect faces
 		_ = gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray)
-		_ = gocv.EqualizeHist(gray, &gray)
 		_ = gocv.GaussianBlur(gray, &gray, image.Pt(3, 3), 0, 0, gocv.BorderDefault)
-		faces := classifier.DetectMultiScaleWithParams(
+		faces := face.DetectMultiScaleWithParams(
 			gray,
 			1.03,
 			6,
@@ -124,13 +127,42 @@ func main() {
 		)
 
 		// draw boxes
-		for _, r := range faces {
-			_ = gocv.Rectangle(&display, r, getColor("green"), 2)
+		accepted := 0
+		for _, f := range faces {
+			// quick geometry filter to reduce false positives
+			aspect := float64(f.Dx()) / float64(f.Dy())
+			if aspect < 0.7 || aspect > 1.4 { // typical front faces ~0.8–1.3
+				continue
+			}
+
+			// secondary validation: detect eyes in ROI (in gray)
+			roi := gray.Region(f)
+			eyes := eyeClf.DetectMultiScaleWithParams(
+				roi, 1.05, 3, 0,
+				image.Pt(maxInt(12, f.Dx()/10), maxInt(12, f.Dy()/10)), // min eye size
+				image.Pt(0, 0),
+			)
+			_ = roi.Close()
+			if len(eyes) == 0 {
+				continue
+			}
+
+			// draw final box
+			_ = gocv.Rectangle(&display, f, getColor("green"), 2)
+
+			// label "human" above the box (avoid going off-screen)
+			y := f.Min.Y - 8
+			if y < 18 {
+				y = f.Min.Y + 18
+			}
+			putShadowText(&display, "human", image.Pt(f.Min.X, y), 1.4)
+
+			accepted++
 		}
 
 		// draw count
 		_ = gocv.PutText(&display,
-			fmt.Sprintf("Faces: %d", len(faces)),
+			fmt.Sprintf("Faces: %d", accepted),
 			image.Pt(10, 75),
 			gocv.FontHersheyPlain, 1.5, getColor("green"), 2,
 		)
@@ -144,7 +176,7 @@ func main() {
 			return
 		case 's', 'S':
 			name := fmt.Sprintf("snapshot_%d.jpg", time.Now().Unix())
-			if ok := gocv.IMWrite(name, display); ok {
+			if ok = gocv.IMWrite(name, display); ok {
 				slog.Info("Saved " + name)
 			} else {
 				slog.Error("Failed to save snapshot")
@@ -189,4 +221,11 @@ func getColor(c string) color.RGBA {
 	default:
 		return getColor("white")
 	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
